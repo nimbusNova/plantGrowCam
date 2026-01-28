@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
+#include "esp_wifi.h"
 #include "config.h"
 #include "camera_module.h"
 #include "sd_card_module.h"
@@ -97,14 +98,14 @@ bool isWiFiConnected() {
 
 bool connectWiFi() {
     Serial.println("Connecting to WiFi");
-    
+
     // Set WiFi mode to station (client) mode
     WiFi.mode(WIFI_STA);
-    
+
     // Disconnect any existing connection
     WiFi.disconnect();
     delay(100);
-    
+
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     int attempts = 0;
@@ -118,6 +119,16 @@ bool connectWiFi() {
         Serial.println("\nWiFi connected!");
         Serial.print("IP Address: ");
         Serial.println(WiFi.localIP());
+
+        // Optimize WiFi for streaming performance
+        WiFi.setSleep(false);  // Disable WiFi power saving
+        esp_wifi_set_ps(WIFI_PS_NONE);  // No power save mode
+
+        // Set WiFi TX power to maximum for better range/speed
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+        Serial.println("WiFi optimizations applied");
+
         return true;
     } else {
         Serial.println("\nWiFi connection failed!");
@@ -184,7 +195,16 @@ void performScheduledCapture() {
         return;
     }
 
-    String filename = String(IMAGE_PREFIX) + String(imageCount) + String(IMAGE_EXTENSION);
+    // Generate timestamp-based filename
+    String filename;
+    if (getLocalTime(&timeinfo)) {
+        char timestamp[32];
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &timeinfo);
+        filename = String(IMAGE_PREFIX) + String(timestamp) + String(IMAGE_EXTENSION);
+    } else {
+        // Fallback to counter if time not available
+        filename = String(IMAGE_PREFIX) + String(imageCount) + String(IMAGE_EXTENSION);
+    }
     imageCount++;
 
     bool success = sdCard.saveImage(fb, filename);

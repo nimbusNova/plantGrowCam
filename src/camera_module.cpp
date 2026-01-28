@@ -43,15 +43,17 @@ void CameraModule::configureCamera(camera_config_t &config) {
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
+    config.grab_mode = CAMERA_GRAB_LATEST;  // Always get latest frame for streaming
 
     if (psramFound()) {
-        config.frame_size = FRAMESIZE_UXGA; // 1600x1200
-        config.jpeg_quality = 25; // Lower quality (higher number = smaller files)
-        config.fb_count = 2;
+        config.frame_size = FRAMESIZE_SVGA; // 800x600 - smaller default
+        config.jpeg_quality = 10;  // High quality for still photos
+        config.fb_count = 2;  // Double buffering for better streaming
+        config.fb_location = CAMERA_FB_IN_PSRAM;  // Use PSRAM for frame buffers
     } else {
-        config.frame_size = FRAMESIZE_SVGA; // 800x600
-        config.jpeg_quality = 30; // Lower quality (higher number = smaller files)
-        config.fb_count = 1;
+        config.frame_size = FRAMESIZE_VGA; // 640x480
+        config.jpeg_quality = 12;
+        config.fb_count = 2;  // Try double buffer even without PSRAM
     }
 }
 

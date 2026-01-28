@@ -2,6 +2,8 @@
 #include "config.h"
 #include <Arduino.h>
 #include <WiFi.h>
+#include <time.h>
+#include "esp_camera.h"
 
 WebServerModule::WebServerModule(CameraModule* cam, SDCardModule* sd, int* imgCount)
     : server(WEB_SERVER_PORT), camera(cam), sdCard(sd), imageCount(imgCount) {}
@@ -85,32 +87,92 @@ void WebServerModule::handleRoot() {
 void WebServerModule::handleStream() {
     WiFiClient client = server.client();
 
+    if (!client.connected()) {
+        return;
+    }
+
+    // Increase TCP send buffer for better throughput
+    client.setNoDelay(true);  // Disable Nagle's algorithm for lower latency
+
+    // Get camera sensor and optimize for streaming
+    sensor_t * s = esp_camera_sensor_get();
+
+    // Store original settings
+    framesize_t original_framesize = FRAMESIZE_UXGA;
+    int original_quality = 10;
+    int original_fb_count = 2;
+
+    if (s) {
+        original_framesize = (framesize_t)s->status.framesize;
+        original_quality = s->status.quality;
+
+        // Aggressive streaming optimizations - prioritize speed
+        s->set_framesize(s, FRAMESIZE_HVGA);  // 480x320 - smaller than VGA
+        s->set_quality(s, 18);  // Higher compression = much smaller files
+        s->set_brightness(s, 0);
+        s->set_contrast(s, 0);
+        s->set_saturation(s, 0);
+        s->set_sharpness(s, 0);
+        s->set_denoise(s, 0);
+        s->set_gainceiling(s, GAINCEILING_2X);
+        s->set_ae_level(s, 0);
+        s->set_special_effect(s, 0);
+        s->set_wb_mode(s, 0);
+        s->set_awb_gain(s, 1);
+        s->set_aec2(s, 0);         // Disable AEC2 for speed
+        s->set_whitebal(s, 1);     // Keep white balance
+        s->set_hmirror(s, 0);
+        s->set_vflip(s, 0);
+    }
+
+    // Send HTTP headers
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+    client.println("Access-Control-Allow-Origin: *");
+    client.println("X-Framerate: 30");
     client.println();
+    client.flush();
+
+    Serial.println("Stream started with optimized settings");
+
+    uint32_t frame_count = 0;
+    uint32_t last_log_time = millis();
 
     while (client.connected()) {
-        camera_fb_t *fb = camera->captureImage();
+        camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
-            Serial.println("Camera capture failed during stream");
-            break;
+            Serial.println("Frame capture failed");
+            continue;
         }
 
-        client.println("--frame");
-        client.println("Content-Type: image/jpeg");
-        client.printf("Content-Length: %d\r\n\r\n", fb->len);
+        // Fast streaming: minimize overhead
+        client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+
+        // Send frame in one write
         client.write(fb->buf, fb->len);
-        client.println();
+        client.print("\r\n");
 
-        camera->releaseFrameBuffer(fb);
+        uint32_t frame_size = fb->len;
+        esp_camera_fb_return(fb);
 
-        if (!client.connected()) {
-            break;
+        frame_count++;
+
+        // Log FPS every 50 frames
+        if (frame_count % 50 == 0) {
+            uint32_t now = millis();
+            float fps = 50000.0 / (now - last_log_time);
+            Serial.printf("Streaming: %.1f FPS, %u bytes/frame\n", fps, frame_size);
+            last_log_time = now;
         }
-
-        // Yield to allow other tasks (including web server) to run
-        delay(10);
     }
+
+    // Restore original camera settings
+    if (s) {
+        s->set_framesize(s, original_framesize);
+        s->set_quality(s, original_quality);
+    }
+
+    Serial.printf("Stream ended after %u frames\n", frame_count);
 }
 
 void WebServerModule::handleCapture() {
@@ -181,7 +243,17 @@ String WebServerModule::captureAndSaveImage() {
         return "Camera capture failed";
     }
 
-    String filename = String(IMAGE_PREFIX) + String(*imageCount) + String(IMAGE_EXTENSION);
+    // Generate timestamp-based filename
+    struct tm timeinfo;
+    String filename;
+    if (getLocalTime(&timeinfo)) {
+        char timestamp[32];
+        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", &timeinfo);
+        filename = String(IMAGE_PREFIX) + String(timestamp) + String(IMAGE_EXTENSION);
+    } else {
+        // Fallback to counter if time not available
+        filename = String(IMAGE_PREFIX) + String(*imageCount) + String(IMAGE_EXTENSION);
+    }
     (*imageCount)++;
 
     bool success = sdCard->saveImage(fb, filename);
