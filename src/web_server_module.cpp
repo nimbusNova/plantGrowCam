@@ -4,14 +4,19 @@
 #include <WiFi.h>
 #include <time.h>
 #include "esp_camera.h"
+#include "img_converters.h"
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 WebServerModule::WebServerModule(CameraModule* cam, SDCardModule* sd, int* imgCount)
-    : server(WEB_SERVER_PORT), camera(cam), sdCard(sd), imageCount(imgCount) {}
+    : server(WEB_SERVER_PORT), stream_httpd(NULL), camera(cam), sdCard(sd), imageCount(imgCount) {}
 
 bool WebServerModule::init() {
-    // Setup routes
+    // Setup routes for WebServer (static pages)
     server.on("/", [this]() { this->handleRoot(); });
-    server.on("/stream", [this]() { this->handleStream(); });
     server.on("/capture", [this]() { this->handleCapture(); });
     server.on("/list", [this]() { this->handleList(); });
     server.on("/download", [this]() { this->handleDownload(); });
@@ -19,7 +24,27 @@ bool WebServerModule::init() {
     server.on("/flash/off", [this]() { this->handleFlashOff(); });
 
     server.begin();
-    Serial.println("Web server started");
+    Serial.println("Web server started on port 80");
+
+    // Setup ESP HTTP Server for streaming (more efficient)
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 81;
+    config.ctrl_port = 32768;
+
+    httpd_uri_t stream_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = streamHandler,
+        .user_ctx  = NULL
+    };
+
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &stream_uri);
+        Serial.println("Stream server started on port 81");
+    } else {
+        Serial.println("Failed to start stream server");
+    }
+
     return true;
 }
 
@@ -28,18 +53,19 @@ void WebServerModule::handleClient() {
 }
 
 void WebServerModule::printServerInfo() {
+    String ip = WiFi.localIP().toString();
     Serial.println("\n========================================");
     Serial.println("Plant Monitor Ready!");
-    Serial.printf("IP Address: http://%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("IP Address: http://%s\n", ip.c_str());
     Serial.println("========================================");
     Serial.println("Available endpoints:");
-    Serial.println("  /               - Home page with links");
-    Serial.println("  /stream         - Live camera stream");
-    Serial.println("  /capture        - Take a picture now");
-    Serial.println("  /list           - List all saved images");
-    Serial.println("  /download?file= - Download an image");
-    Serial.println("  /flash/on       - Turn flash ON");
-    Serial.println("  /flash/off      - Turn flash OFF");
+    Serial.printf("  http://%s/          - Home page\n", ip.c_str());
+    Serial.printf("  http://%s:81/        - Live stream (ESP HTTP Server)\n", ip.c_str());
+    Serial.printf("  http://%s/capture    - Take picture\n", ip.c_str());
+    Serial.printf("  http://%s/list       - List images\n", ip.c_str());
+    Serial.printf("  http://%s/download?file= - Download image\n", ip.c_str());
+    Serial.printf("  http://%s/flash/on   - Flash ON\n", ip.c_str());
+    Serial.printf("  http://%s/flash/off  - Flash OFF\n", ip.c_str());
     Serial.println("========================================\n");
 }
 
@@ -66,11 +92,12 @@ String WebServerModule::generateHTMLFooter() {
 }
 
 void WebServerModule::handleRoot() {
+    String ip = WiFi.localIP().toString();
     String html = generateHTMLHeader("Plant Monitor");
     html += "<h1>Plant Monitor Dashboard</h1>";
     html += "<p>Welcome to your ESP32-CAM Plant Monitoring System</p>";
     html += "<div>";
-    html += "<a class='button' href='/stream'>Live Stream</a>";
+    html += "<a class='button' href='http://" + ip + ":81/' target='_blank'>Live Stream</a>";
     html += "<a class='button' href='/capture'>Take Picture Now</a>";
     html += "<a class='button' href='/list'>View Saved Images</a>";
     html += "</div>";
@@ -84,95 +111,65 @@ void WebServerModule::handleRoot() {
     server.send(200, "text/html", html);
 }
 
-void WebServerModule::handleStream() {
-    WiFiClient client = server.client();
+// ESP HTTP Server streaming handler (proven to work well)
+esp_err_t WebServerModule::streamHandler(httpd_req_t *req) {
+    camera_fb_t * fb = NULL;
+    esp_err_t res = ESP_OK;
+    size_t _jpg_buf_len = 0;
+    uint8_t * _jpg_buf = NULL;
+    char * part_buf[64];
 
-    if (!client.connected()) {
-        return;
+    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+    if(res != ESP_OK){
+        return res;
     }
 
-    // Increase TCP send buffer for better throughput
-    client.setNoDelay(true);  // Disable Nagle's algorithm for lower latency
+    Serial.println("Stream started");
 
-    // Get camera sensor and optimize for streaming
-    sensor_t * s = esp_camera_sensor_get();
-
-    // Store original settings
-    framesize_t original_framesize = FRAMESIZE_UXGA;
-    int original_quality = 10;
-    int original_fb_count = 2;
-
-    if (s) {
-        original_framesize = (framesize_t)s->status.framesize;
-        original_quality = s->status.quality;
-
-        // Aggressive streaming optimizations - prioritize speed
-        s->set_framesize(s, FRAMESIZE_HVGA);  // 480x320 - smaller than VGA
-        s->set_quality(s, 18);  // Higher compression = much smaller files
-        s->set_brightness(s, 0);
-        s->set_contrast(s, 0);
-        s->set_saturation(s, 0);
-        s->set_sharpness(s, 0);
-        s->set_denoise(s, 0);
-        s->set_gainceiling(s, GAINCEILING_2X);
-        s->set_ae_level(s, 0);
-        s->set_special_effect(s, 0);
-        s->set_wb_mode(s, 0);
-        s->set_awb_gain(s, 1);
-        s->set_aec2(s, 0);         // Disable AEC2 for speed
-        s->set_whitebal(s, 1);     // Keep white balance
-        s->set_hmirror(s, 0);
-        s->set_vflip(s, 0);
-    }
-
-    // Send HTTP headers
-    client.println("HTTP/1.1 200 OK");
-    client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-    client.println("Access-Control-Allow-Origin: *");
-    client.println("X-Framerate: 30");
-    client.println();
-    client.flush();
-
-    Serial.println("Stream started with optimized settings");
-
-    uint32_t frame_count = 0;
-    uint32_t last_log_time = millis();
-
-    while (client.connected()) {
-        camera_fb_t *fb = esp_camera_fb_get();
+    while(true){
+        fb = esp_camera_fb_get();
         if (!fb) {
-            Serial.println("Frame capture failed");
-            continue;
+            Serial.println("Camera capture failed");
+            res = ESP_FAIL;
+        } else {
+            if(fb->format != PIXFORMAT_JPEG){
+                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+                esp_camera_fb_return(fb);
+                fb = NULL;
+                if(!jpeg_converted){
+                    Serial.println("JPEG compression failed");
+                    res = ESP_FAIL;
+                }
+            } else {
+                _jpg_buf_len = fb->len;
+                _jpg_buf = fb->buf;
+            }
         }
-
-        // Fast streaming: minimize overhead
-        client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
-
-        // Send frame in one write
-        client.write(fb->buf, fb->len);
-        client.print("\r\n");
-
-        uint32_t frame_size = fb->len;
-        esp_camera_fb_return(fb);
-
-        frame_count++;
-
-        // Log FPS every 50 frames
-        if (frame_count % 50 == 0) {
-            uint32_t now = millis();
-            float fps = 50000.0 / (now - last_log_time);
-            Serial.printf("Streaming: %.1f FPS, %u bytes/frame\n", fps, frame_size);
-            last_log_time = now;
+        if(res == ESP_OK){
+            size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
+            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+        }
+        if(res == ESP_OK){
+            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        }
+        if(res == ESP_OK){
+            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+        }
+        if(fb){
+            esp_camera_fb_return(fb);
+            fb = NULL;
+            _jpg_buf = NULL;
+        } else if(_jpg_buf){
+            free(_jpg_buf);
+            _jpg_buf = NULL;
+        }
+        if(res != ESP_OK){
+            break;
         }
     }
 
-    // Restore original camera settings
-    if (s) {
-        s->set_framesize(s, original_framesize);
-        s->set_quality(s, original_quality);
-    }
-
-    Serial.printf("Stream ended after %u frames\n", frame_count);
+    Serial.println("Stream ended");
+    return res;
 }
 
 void WebServerModule::handleCapture() {

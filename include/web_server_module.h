@@ -2,6 +2,7 @@
 #define WEB_SERVER_MODULE_H
 
 #include <WebServer.h>
+#include "esp_http_server.h"
 #include "camera_module.h"
 #include "sd_card_module.h"
 
@@ -15,13 +16,14 @@ public:
 
 private:
     WebServer server;
+    httpd_handle_t stream_httpd;
     CameraModule* camera;
     SDCardModule* sdCard;
     int* imageCount;
 
     // Route handlers
     void handleRoot();
-    void handleStream();
+    static esp_err_t streamHandler(httpd_req_t *req);
     void handleCapture();
     void handleList();
     void handleDownload();
